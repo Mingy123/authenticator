@@ -10,7 +10,7 @@ mod storage;
 mod ui;
 
 use ui::auth_ui::{AuthResult, AuthUI};
-use ui::main_ui;
+use ui::{main_ui, qr_ui};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct TotpEntry {
@@ -33,6 +33,8 @@ struct AuthenticatorApp {
     current_file_path: Option<PathBuf>,
     current_password: String,
     show_secret: bool,
+    qr_scanner: qr_ui::QrUI,
+    launch_qr_scanner: bool,
 }
 
 impl Default for AuthenticatorApp {
@@ -52,6 +54,8 @@ impl Default for AuthenticatorApp {
             current_file_path: None,
             current_password: String::new(),
             show_secret: false,
+            qr_scanner: qr_ui::QrUI::default(),
+            launch_qr_scanner: false,
         }
     }
 }
@@ -153,6 +157,20 @@ impl eframe::App for AuthenticatorApp {
             return;
         }
 
+        // Show QR scanner if triggered
+        if self.launch_qr_scanner {
+            let result = self.qr_scanner.show(ctx);
+            if let Some(qr_ui::QrResult::TotpUri { label, secret }) = result {
+                self.new_entry_label = label;
+                self.new_entry_secret = secret;
+                self.launch_qr_scanner = false;
+                self.qr_scanner = qr_ui::QrUI::default();
+            } else if self.qr_scanner.is_cancelled() {
+                self.launch_qr_scanner = false;
+                self.qr_scanner = qr_ui::QrUI::default();
+            }
+        }
+
         // Main authenticated UI
         main_ui::show_main_ui(self, ctx);
     }
@@ -171,4 +189,91 @@ fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(|_cc| Ok(Box::new(AuthenticatorApp::default()))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_entry() {
+        let mut app = AuthenticatorApp::default();
+        assert!(app.entries.is_empty());
+
+        app.add_entry("Test Label".into(), "JBSWY3DPEHPK3PXP".into());
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].label, "Test Label");
+        assert_eq!(app.entries[0].secret, "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn test_add_multiple_entries() {
+        let mut app = AuthenticatorApp::default();
+        app.add_entry("Alpha".into(), "SECRET1".into());
+        app.add_entry("Beta".into(), "SECRET2".into());
+        app.add_entry("Gamma".into(), "SECRET3".into());
+        assert_eq!(app.entries.len(), 3);
+    }
+
+    #[test]
+    fn test_remove_entry() {
+        let mut app = AuthenticatorApp::default();
+        app.add_entry("Entry1".into(), "SECRET1".into());
+        app.add_entry("Entry2".into(), "SECRET2".into());
+        app.add_entry("Entry3".into(), "SECRET3".into());
+
+        app.remove_entry(1);
+        assert_eq!(app.entries.len(), 2);
+        assert_eq!(app.entries[0].label, "Entry1");
+        assert_eq!(app.entries[1].label, "Entry3");
+    }
+
+    #[test]
+    fn test_remove_entry_out_of_bounds() {
+        let mut app = AuthenticatorApp::default();
+        app.add_entry("Only".into(), "SECRET".into());
+        app.remove_entry(5);
+        assert_eq!(app.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_entry_from_empty() {
+        let mut app = AuthenticatorApp::default();
+        app.remove_entry(0);
+        assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn test_select_entry() {
+        let mut app = AuthenticatorApp::default();
+        app.entries.push(TotpEntry {
+            label: "test".into(),
+            secret: "JBSWY3DPEHPK3PXP".into(),
+        });
+
+        app.select_entry(0);
+        assert_eq!(app.selected_entry, Some(0));
+        assert_eq!(app.totp_code.len(), 6);
+    }
+
+    #[test]
+    fn test_get_time_remaining_range() {
+        let app = AuthenticatorApp::default();
+        let remaining = app.get_time_remaining();
+        assert!(remaining < 30);
+    }
+
+    #[test]
+    fn test_default_app_state() {
+        let app = AuthenticatorApp::default();
+        assert!(app.entries.is_empty());
+        assert!(app.error_message_app.is_none());
+        assert!(!app.is_authenticated);
+        assert!(app.selected_entry.is_none());
+        assert!(app.totp_code.is_empty());
+        assert!(app.current_file_path.is_none());
+        assert!(app.current_password.is_empty());
+        assert!(!app.show_secret);
+        assert!(!app.launch_qr_scanner);
+    }
 }
