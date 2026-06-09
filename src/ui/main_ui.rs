@@ -35,9 +35,15 @@ pub fn show_main_ui(app: &mut AuthenticatorApp, ctx: &egui::Context) {
         ui.label("Secret:");
         let resp_secret = ui.text_edit_singleline(&mut new_entry_secret);
         let mut add_clicked = false;
-        if ui.button("Add").clicked() {
-            add_clicked = true;
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Add").clicked() {
+                add_clicked = true;
+            }
+            ui.label("or");
+            if ui.button("Scan QR code").clicked() {
+                app.launch_qr_scanner = true;
+            }
+        });
         if (resp_label.lost_focus() || resp_secret.lost_focus())
             && ui.input(|i| i.key_pressed(egui::Key::Enter))
         {

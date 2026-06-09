@@ -87,3 +87,78 @@ pub fn derive_key_from_password(password: &str) -> [u8; 32] {
     key.copy_from_slice(&result);
     key
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_key_deterministic() {
+        let key1 = derive_key_from_password("mypassword");
+        let key2 = derive_key_from_password("mypassword");
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_derive_key_length() {
+        let key = derive_key_from_password("anything");
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn test_derive_key_different_passwords() {
+        let key1 = derive_key_from_password("password1");
+        let key2 = derive_key_from_password("password2");
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let key = derive_key_from_password("test-password");
+        let original = r#"{"hello":"world"}"#;
+        let (ciphertext, nonce) = encrypt(original, &key).unwrap();
+        let decrypted = decrypt(&ciphertext, &nonce, &key).unwrap();
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn test_decrypt_wrong_key_fails() {
+        let correct_key = derive_key_from_password("correct");
+        let wrong_key = derive_key_from_password("wrong");
+        let (ciphertext, nonce) = encrypt("data", &correct_key).unwrap();
+        assert!(decrypt(&ciphertext, &nonce, &wrong_key).is_err());
+    }
+
+    #[test]
+    fn test_encrypt_produces_different_ciphertexts() {
+        let key = derive_key_from_password("password");
+        let (c1, _) = encrypt("same", &key).unwrap();
+        let (c2, _) = encrypt("same", &key).unwrap();
+        assert_ne!(c1, c2); // random nonce
+    }
+
+    #[test]
+    fn test_generate_totp_empty_secret() {
+        let mut app = crate::AuthenticatorApp::default();
+        app.generate_totp();
+        assert!(app.error_message_app.is_some());
+    }
+
+    #[test]
+    fn test_generate_totp_valid_secret() {
+        let mut app = crate::AuthenticatorApp::default();
+        app.secret = "JBSWY3DPEHPK3PXP".into();
+        app.generate_totp();
+        assert_eq!(app.totp_code.len(), 6);
+        assert!(app.totp_code.chars().all(|c| c.is_ascii_digit()));
+        assert!(app.error_message_app.is_none());
+    }
+
+    #[test]
+    fn test_generate_totp_invalid_secret() {
+        let mut app = crate::AuthenticatorApp::default();
+        app.secret = "!!invalid!!".into();
+        app.generate_totp();
+        assert!(app.error_message_app.is_some());
+    }
+}
