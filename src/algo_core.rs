@@ -1,54 +1,22 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes_gcm::aead::OsRng;
 use aes_gcm::aead::rand_core::RngCore;
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use totp_rs::{Algorithm, Secret, TOTP};
 
-use crate::AuthenticatorApp;
-
-impl AuthenticatorApp {
-    pub fn generate_totp(&mut self) {
-        if self.secret.trim().is_empty() {
-            self.error_message_app = Some("Please enter a secret".to_string());
-            return;
-        }
-
-        // Create TOTP instance with 30-second time step
-        let secret = Secret::Encoded(self.secret.trim().to_string());
-        let secret_bytes = match secret.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                self.error_message_app = Some(format!("Invalid secret format: {}", e));
-                return;
-            }
-        };
-
-        let totp = TOTP::new_unchecked(Algorithm::SHA1, 6, 1, 30, secret_bytes);
-
-        // Get current timestamp
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // Generate TOTP code
-        match totp.generate_current() {
-            Ok(code) => {
-                self.totp_code = code;
-                self.last_update = now;
-                self.error_message_app = None;
-            }
-            Err(e) => {
-                self.error_message_app = Some(format!("Failed to generate TOTP: {}", e));
-            }
-        }
-    }
+/// Derive a 256-bit key from a password using SHA-256.
+pub fn derive_key_from_password(password: &str) -> [u8; 32] {
+    let result = Sha256::digest(password.as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    key
 }
 
+/// Encrypt plaintext JSON with AES-256-GCM.
+/// Returns (base64_ciphertext, base64_nonce).
 pub fn encrypt(json: &str, key_bytes: &[u8; 32]) -> Result<(String, String), String> {
     let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
@@ -63,6 +31,7 @@ pub fn encrypt(json: &str, key_bytes: &[u8; 32]) -> Result<(String, String), Str
     }
 }
 
+/// Decrypt AES-256-GCM ciphertext.
 pub fn decrypt(cipher_b64: &str, nonce_b64: &str, key_bytes: &[u8; 32]) -> Result<String, String> {
     let cipher_bytes = STANDARD
         .decode(cipher_b64)
@@ -81,11 +50,25 @@ pub fn decrypt(cipher_b64: &str, nonce_b64: &str, key_bytes: &[u8; 32]) -> Resul
         .and_then(|plain| String::from_utf8(plain).map_err(|e| format!("UTF8 error: {}", e)))
 }
 
-pub fn derive_key_from_password(password: &str) -> [u8; 32] {
-    let result = Sha256::digest(password.as_bytes());
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&result);
-    key
+/// Generate a TOTP code from a base32-encoded secret.
+pub fn generate_totp_code(secret: &str) -> Result<String, String> {
+    let secret_obj = Secret::Encoded(secret.trim().to_string());
+    let secret_bytes = secret_obj
+        .to_bytes()
+        .map_err(|e| format!("Invalid secret format: {}", e))?;
+
+    let totp = TOTP::new_unchecked(Algorithm::SHA1, 6, 1, 30, secret_bytes);
+    totp.generate_current()
+        .map_err(|e| format!("Failed to generate TOTP: {}", e))
+}
+
+/// Get seconds remaining in the current 30-second TOTP window.
+pub fn get_time_remaining() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    30 - (now % 30)
 }
 
 #[cfg(test)]
@@ -138,27 +121,20 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_totp_empty_secret() {
-        let mut app = crate::AuthenticatorApp::default();
-        app.generate_totp();
-        assert!(app.error_message_app.is_some());
-    }
-
-    #[test]
     fn test_generate_totp_valid_secret() {
-        let mut app = crate::AuthenticatorApp::default();
-        app.secret = "JBSWY3DPEHPK3PXP".into();
-        app.generate_totp();
-        assert_eq!(app.totp_code.len(), 6);
-        assert!(app.totp_code.chars().all(|c| c.is_ascii_digit()));
-        assert!(app.error_message_app.is_none());
+        let code = generate_totp_code("JBSWY3DPEHPK3PXP").unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
     }
 
     #[test]
     fn test_generate_totp_invalid_secret() {
-        let mut app = crate::AuthenticatorApp::default();
-        app.secret = "!!invalid!!".into();
-        app.generate_totp();
-        assert!(app.error_message_app.is_some());
+        assert!(generate_totp_code("!!invalid!!").is_err());
+    }
+
+    #[test]
+    fn test_get_time_remaining_range() {
+        let remaining = get_time_remaining();
+        assert!(remaining < 30);
     }
 }

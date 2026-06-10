@@ -1,279 +1,489 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console
+//! TOTP Authenticator - Dioxus cross-platform app
+//! Supports web, desktop, and mobile.
 
-use eframe::egui;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use dioxus::prelude::*;
 
 mod algo_core;
+mod qr_parser;
 mod storage;
-mod ui;
 
-use ui::auth_ui::{AuthResult, AuthUI};
-use ui::{main_ui, qr_ui};
+use std::path::PathBuf;
+use std::time::Duration;
 
-#[derive(Serialize, Deserialize, Clone)]
-struct TotpEntry {
-    label: String,
-    secret: String,
+use algo_core::{generate_totp_code, get_time_remaining};
+use storage::{load_entries_encrypted, save_entries_encrypted, TotpEntry};
+
+// ---------------------------------------------------------------------------
+// Entry Point
+// ---------------------------------------------------------------------------
+
+fn main() {
+    dioxus::launch(app);
 }
 
-struct AuthenticatorApp {
+// ---------------------------------------------------------------------------
+// App State
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+enum Screen {
+    Auth,
+    Main,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AuthView {
+    Create,
+    Open,
+}
+
+#[derive(Clone, Default)]
+struct AppState {
+    screen: Screen,
+    auth_view: AuthView,
     entries: Vec<TotpEntry>,
-    error_message_app: Option<String>,
-    is_authenticated: bool,
-    last_update: u64,
-    new_entry_label: String,
-    new_entry_secret: String,
-    pending_delete: Option<usize>,
-    secret: String,
     selected_entry: Option<usize>,
-    totp_code: String,
-    auth_ui: AuthUI,
-    current_file_path: Option<PathBuf>,
-    current_password: String,
+    password: String,
+    password_confirm: String,
+    file_path: String,
+    error: Option<String>,
+    new_label: String,
+    new_secret: String,
     show_secret: bool,
-    qr_scanner: qr_ui::QrUI,
-    launch_qr_scanner: bool,
+    pending_delete: Option<usize>,
+    totp_code: String,
+    time_remaining: u64,
 }
 
-impl Default for AuthenticatorApp {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            error_message_app: None,
-            is_authenticated: false,
-            last_update: 0,
-            new_entry_label: String::new(),
-            new_entry_secret: String::new(),
-            pending_delete: None,
-            secret: String::new(),
-            selected_entry: None,
-            totp_code: String::new(),
-            auth_ui: AuthUI::default(),
-            current_file_path: None,
-            current_password: String::new(),
-            show_secret: false,
-            qr_scanner: qr_ui::QrUI::default(),
-            launch_qr_scanner: false,
+// ---------------------------------------------------------------------------
+// Root App Component
+// ---------------------------------------------------------------------------
+
+fn app() -> Element {
+    use_context_provider(|| Signal::new(AppState::default()));
+
+    let state = use_context::<Signal<AppState>>();
+
+    // Timer effect to update TOTP code every second
+    use_future(move || {
+        let state_clone = state;
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                state_clone.with_mut(|s| {
+                    if let Some(idx) = s.selected_entry {
+                        if let Some(entry) = s.entries.get(idx) {
+                            if let Ok(code) = generate_totp_code(&entry.secret) {
+                                s.totp_code = code;
+                            }
+                        }
+                    }
+                    s.time_remaining = get_time_remaining();
+                });
+            }
         }
+    });
+
+    let current_screen = state.read().screen.clone();
+    match current_screen {
+        Screen::Auth => rsx! { AuthScreen {} },
+        Screen::Main => rsx! { MainScreen {} },
     }
 }
 
-impl AuthenticatorApp {
-    fn add_entry(&mut self, label: String, secret: String) {
-        self.entries.push(TotpEntry { label, secret });
-        if let Some(path) = &self.current_file_path {
-            if self
-                .save_entries_encrypted(path.clone(), &self.current_password)
-                .is_err()
-            {
-                eprintln!("Error while saving entries");
+// ---------------------------------------------------------------------------
+// Auth Screen
+// ---------------------------------------------------------------------------
+
+#[component]
+fn AuthScreen() -> Element {
+    let state = use_context::<Signal<AppState>>();
+    let auth_view = state.read().auth_view.clone();
+
+    rsx! {
+        div {
+            style: "display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; padding: 20px; background: #f5f5f5;",
+            div {
+                style: "background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); width: 100%; max-width: 400px;",
+                h1 { style: "text-align: center; margin-bottom: 24px; color: #333;", "TOTP Authenticator" }
+                div {
+                    style: "display: flex; margin-bottom: 24px; border-radius: 8px; overflow: hidden; border: 1px solid #ddd;",
+                    TabButton { label: "Open Existing", active: matches!(auth_view, AuthView::Open), target: AuthView::Open }
+                    TabButton { label: "Create New", active: matches!(auth_view, AuthView::Create), target: AuthView::Create }
+                }
+                match auth_view {
+                    AuthView::Open => rsx! { OpenFileForm {} },
+                    AuthView::Create => rsx! { CreateFileForm {} },
+                }
+                ErrorDisplay {}
             }
         }
     }
+}
 
-    fn remove_entry(&mut self, index: usize) {
-        if index < self.entries.len() {
-            self.entries.remove(index);
-            if let Some(path) = &self.current_file_path {
-                if self
-                    .save_entries_encrypted(path.clone(), &self.current_password)
-                    .is_err()
-                {
-                    eprintln!("Error while saving entries");
+#[component]
+fn TabButton(label: String, active: bool, target: AuthView) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let bg = if active { "background: #007bff; color: white;" } else { "background: white; color: #333;" };
+
+    rsx! {
+        button {
+            style: "flex: 1; padding: 10px; border: none; cursor: pointer; {bg}",
+            onclick: move |_| state.with_mut(|s| s.auth_view = target.clone()),
+            "{label}"
+        }
+    }
+}
+
+#[component]
+fn OpenFileForm() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    rsx! {
+        div { style: "display: flex; flex-direction: column; gap: 12px;",
+            AuthInput {
+                label: "File path:",
+                value: state.read().file_path.clone(),
+                oninput: Box::new(move |val: String| state.with_mut(|s| s.file_path = val)),
+                placeholder: "/path/to/file.totp",
+                password: false,
+            }
+            AuthInput {
+                label: "Password:",
+                value: state.read().password.clone(),
+                oninput: Box::new(move |val: String| state.with_mut(|s| s.password = val)),
+                placeholder: "Enter password",
+                password: true,
+            }
+            button {
+                style: "padding: 12px; background: #007bff; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 8px;",
+                onclick: move |_| try_unlock(&mut state),
+                "Unlock"
+            }
+        }
+    }
+}
+
+fn try_unlock(state: &mut Signal<AppState>) {
+    let password = state.read().password.clone();
+    let path_str = state.read().file_path.clone();
+    if password.is_empty() || path_str.is_empty() {
+        state.with_mut(|s| s.error = Some("Password and file path required".into()));
+        return;
+    }
+    let path = PathBuf::from(path_str);
+    match load_entries_encrypted(path, &password) {
+        Ok(save_file) => {
+            state.with_mut(|s| {
+                s.entries = save_file.entries;
+                s.screen = Screen::Main;
+                s.error = None;
+            });
+        }
+        Err(e) => {
+            state.with_mut(|s| s.error = Some(e.to_string()));
+        }
+    }
+}
+
+#[component]
+fn CreateFileForm() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    rsx! {
+        div { style: "display: flex; flex-direction: column; gap: 12px;",
+            AuthInput {
+                label: "File path:",
+                value: state.read().file_path.clone(),
+                oninput: Box::new(move |val: String| state.with_mut(|s| s.file_path = val)),
+                placeholder: "/path/to/file.totp",
+                password: false,
+            }
+            AuthInput {
+                label: "Set password:",
+                value: state.read().password.clone(),
+                oninput: Box::new(move |val: String| state.with_mut(|s| s.password = val)),
+                placeholder: "Enter password",
+                password: true,
+            }
+            AuthInput {
+                label: "Confirm password:",
+                value: state.read().password_confirm.clone(),
+                oninput: Box::new(move |val: String| state.with_mut(|s| s.password_confirm = val)),
+                placeholder: "Confirm password",
+                password: true,
+            }
+            button {
+                style: "padding: 12px; background: #28a745; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 8px;",
+                onclick: move |_| try_create(&mut state),
+                "Create"
+            }
+        }
+    }
+}
+
+fn try_create(state: &mut Signal<AppState>) {
+    let password = state.read().password.clone();
+    let confirm = state.read().password_confirm.clone();
+    let path_str = state.read().file_path.clone();
+    if password.is_empty() || path_str.is_empty() {
+        state.with_mut(|s| s.error = Some("Password and file path required".into()));
+        return;
+    }
+    if password != confirm {
+        state.with_mut(|s| s.error = Some("Passwords do not match".into()));
+        return;
+    }
+    let path = PathBuf::from(path_str);
+    match save_entries_encrypted(&[], path, &password) {
+        Ok(()) => {
+            state.with_mut(|s| {
+                s.entries.clear();
+                s.screen = Screen::Main;
+                s.error = None;
+            });
+        }
+        Err(e) => {
+            state.with_mut(|s| s.error = Some(e));
+        }
+    }
+}
+
+#[component]
+fn AuthInput(label: String, value: String, oninput: Box<dyn Fn(String)>, placeholder: String, password: bool) -> Element {
+    let type_attr = if password { "password" } else { "text" };
+
+    rsx! {
+        label { style: "font-weight: 500; color: #555;", "{label}" }
+        input {
+            style: "padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; width: 100%; box-sizing: border-box;",
+            value: "{value}",
+            oninput: move |evt| oninput(evt.value().clone()),
+            r#type: "{type_attr}",
+            placeholder: "{placeholder}"
+        }
+    }
+}
+
+#[component]
+fn ErrorDisplay() -> Element {
+    let state = use_context::<Signal<AppState>>();
+    let error = state.read().error.clone();
+
+    if let Some(err) = error {
+        rsx! {
+            div { style: "background: #f8d7da; color: #721c24; padding: 10px; border-radius: 6px; margin-top: 12px; font-size: 14px;",
+                "{err}"
+            }
+        }
+    } else {
+        rsx! {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main Screen
+// ---------------------------------------------------------------------------
+
+#[component]
+fn MainScreen() -> Element {
+    rsx! {
+        div { style: "display: flex; height: 100vh; overflow: hidden;",
+            Sidebar {}
+            MainContent {}
+        }
+    }
+}
+
+#[component]
+fn Sidebar() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let entries = state.read().entries.clone();
+    let selected = state.read().selected_entry;
+
+    rsx! {
+        div {
+            style: "width: 280px; min-width: 280px; background: #f8f9fa; border-right: 1px solid #dee2e6; display: flex; flex-direction: column; overflow: hidden;",
+            div { style: "padding: 16px; border-bottom: 1px solid #dee2e6;",
+                h2 { style: "margin: 0; font-size: 18px; color: #333;", "Accounts" }
+            }
+            div { style: "flex: 1; overflow-y: auto; padding: 8px;",
+                for (i, entry) in entries.iter().enumerate() {
+                    SidebarItem { entry: entry.clone(), index: i, selected: selected == Some(i) }
+                }
+            }
+            div { style: "padding: 16px; border-top: 1px solid #dee2e6; background: white;",
+                h3 { style: "margin: 0 0 12px 0; font-size: 14px; color: #666;", "Add Account" }
+                input {
+                    style: "width: 100%; padding: 8px; margin-bottom: 8px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 13px;",
+                    value: "{state.read().new_label}",
+                    oninput: move |evt| state.with_mut(|s| s.new_label = evt.value().clone()),
+                    placeholder: "Label"
+                }
+                input {
+                    style: "width: 100%; padding: 8px; margin-bottom: 8px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 13px;",
+                    value: "{state.read().new_secret}",
+                    oninput: move |evt| state.with_mut(|s| s.new_secret = evt.value().clone()),
+                    placeholder: "Secret (base32)"
+                }
+                button {
+                    style: "width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px;",
+                    onclick: move |_| add_entry(&mut state),
+                    "Add"
                 }
             }
         }
     }
-
-    fn select_entry(&mut self, index: usize) {
-        if let Some(entry) = self.entries.get(index) {
-            self.secret = entry.secret.clone();
-            self.selected_entry = Some(index);
-            self.show_secret = false;
-            self.generate_totp();
-        }
-    }
-
-    fn get_time_remaining(&self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        30 - (now % 30)
-    }
 }
 
-impl eframe::App for AuthenticatorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Authentication gate
-        if !self.is_authenticated {
-            if let Some(auth_result) = self.auth_ui.show(ctx) {
-                match auth_result {
-                    AuthResult::CreateNew { path, password } => {
-                        match self.save_entries_encrypted(path.clone(), &password) {
-                            Ok(_) => {
-                                self.error_message_app = None;
-                                self.is_authenticated = true;
-                                self.current_file_path = Some(path.clone());
-                                self.current_password = password;
-                                if let Err(e) = self.auth_ui.persist_last_used_file_path(&path) {
-                                    self.error_message_app = Some(format!(
-                                        "File created, but failed to store last used path: {}",
-                                        e
-                                    ));
-                                }
-                            }
-                            Err(e) => {
-                                self.auth_ui.error_message =
-                                    Some(format!("Failed to create file: {}", e));
-                            }
-                        }
-                    }
-                    AuthResult::UseExisting { path, password } => {
-                        match AuthenticatorApp::load_entries_encrypted(path.clone(), &password) {
-                            Ok(save_file) => {
-                                self.error_message_app = None;
-                                self.entries = save_file.entries;
-                                self.is_authenticated = true;
-                                self.current_file_path = Some(path.clone());
-                                self.current_password = password;
-                                if let Err(e) = self.auth_ui.persist_last_used_file_path(&path) {
-                                    self.error_message_app = Some(format!(
-                                        "File loaded, but failed to store last used path: {}",
-                                        e
-                                    ));
-                                }
-                            }
-                            Err(e) => {
-                                self.auth_ui.error_message =
-                                    Some(format!("Failed to load file: {}", e.to_string()));
-                            }
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
-        // Show QR scanner if triggered
-        if self.launch_qr_scanner {
-            let result = self.qr_scanner.show(ctx);
-            if let Some(qr_ui::QrResult::TotpUri { label, secret }) = result {
-                self.new_entry_label = label;
-                self.new_entry_secret = secret;
-                self.launch_qr_scanner = false;
-                self.qr_scanner = qr_ui::QrUI::default();
-            } else if self.qr_scanner.is_cancelled() {
-                self.launch_qr_scanner = false;
-                self.qr_scanner = qr_ui::QrUI::default();
-            }
-        }
-
-        // Main authenticated UI
-        main_ui::show_main_ui(self, ctx);
-    }
-}
-
-fn main() -> Result<(), eframe::Error> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 300.0])
-            .with_resizable(true),
-        ..Default::default()
+#[component]
+fn SidebarItem(entry: TotpEntry, index: usize, selected: bool) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let style = if selected {
+        "padding: 12px; margin-bottom: 4px; border-radius: 8px; background: #007bff; color: white; cursor: pointer; font-weight: 500;"
+    } else {
+        "padding: 12px; margin-bottom: 4px; border-radius: 8px; background: white; color: #333; cursor: pointer; border: 1px solid #e9ecef;"
     };
 
-    eframe::run_native(
-        "TOTP Authenticator",
-        options,
-        Box::new(|_cc| Ok(Box::new(AuthenticatorApp::default()))),
-    )
+    rsx! {
+        div {
+            style: "{style}",
+            onclick: move |_| {
+                state.with_mut(|s| {
+                    s.selected_entry = Some(index);
+                    s.show_secret = false;
+                    if let Some(e) = s.entries.get(index) {
+                        if let Ok(code) = generate_totp_code(&e.secret) {
+                            s.totp_code = code;
+                        }
+                    }
+                });
+            },
+            "{entry.label}"
+        }
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn add_entry(state: &mut Signal<AppState>) {
+    let label = state.read().new_label.trim().to_string();
+    let secret = state.read().new_secret.trim().to_string();
+    if label.is_empty() || secret.is_empty() {
+        state.with_mut(|s| s.error = Some("Label and secret required".into()));
+        return;
+    }
+    if generate_totp_code(&secret).is_err() {
+        state.with_mut(|s| s.error = Some("Invalid secret format".into()));
+        return;
+    }
+    state.with_mut(|s| {
+        s.entries.push(TotpEntry { label, secret });
+        s.new_label.clear();
+        s.new_secret.clear();
+        s.error = None;
+    });
+}
 
-    #[test]
-    fn test_add_entry() {
-        let mut app = AuthenticatorApp::default();
-        assert!(app.entries.is_empty());
+#[component]
+fn MainContent() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let selected = state.read().selected_entry;
+    let show_secret = state.read().show_secret;
+    let totp_code = state.read().totp_code.clone();
+    let time_remaining = state.read().time_remaining;
+    let pending_delete = state.read().pending_delete;
 
-        app.add_entry("Test Label".into(), "JBSWY3DPEHPK3PXP".into());
-        assert_eq!(app.entries.len(), 1);
-        assert_eq!(app.entries[0].label, "Test Label");
-        assert_eq!(app.entries[0].secret, "JBSWY3DPEHPK3PXP");
+    if let Some(idx) = selected {
+        let entry = state.read().entries.get(idx).cloned();
+        if let Some(entry) = entry {
+            let progress = (time_remaining as f64 / 30.0) * 100.0;
+            return rsx! {
+                div {
+                    style: "flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px; background: white;",
+                    div {
+                        style: "text-align: center; max-width: 400px; width: 100%;",
+                        h2 { style: "font-size: 28px; color: #333; margin-bottom: 24px;", "{entry.label}" }
+                        div {
+                            style: "font-size: 56px; font-family: monospace; font-weight: bold; color: #007bff; letter-spacing: 8px; margin: 24px 0;",
+                            "{totp_code}"
+                        }
+                        div {
+                            style: "width: 100%; height: 8px; background: #e9ecef; border-radius: 4px; overflow: hidden; margin: 16px 0;",
+                            div {
+                                style: "height: 100%; background: linear-gradient(90deg, #dc3545, #ffc107, #28a745); border-radius: 4px; transition: width 1s linear;",
+                                width: "{progress}%"
+                            }
+                        }
+                        div { style: "color: #666; font-size: 14px; margin-bottom: 24px;",
+                            "{time_remaining}s remaining"
+                        }
+                        div {
+                            style: "display: flex; gap: 12px; justify-content: center;",
+                            button {
+                                style: "padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 6px; cursor: pointer;",
+                                onclick: move |_| state.with_mut(|s| s.show_secret = !s.show_secret),
+                                if show_secret { "Hide Secret" } else { "Show Secret" }
+                            }
+                            button {
+                                style: "padding: 10px 20px; background: #dc3545; color: white; border: none; border-radius: 6px; cursor: pointer;",
+                                onclick: move |_| state.with_mut(|s| s.pending_delete = Some(idx)),
+                                "Delete"
+                            }
+                        }
+                        if show_secret {
+                            div {
+                                style: "margin-top: 16px; padding: 12px; background: #f8f9fa; border-radius: 6px; font-family: monospace; color: #666; font-size: 14px; word-break: break-all;",
+                                "{entry.secret}"
+                            }
+                        }
+                    }
+                    if let Some(del_idx) = pending_delete {
+                        ConfirmDeleteDialog { idx: del_idx }
+                    }
+                }
+            };
+        }
     }
 
-    #[test]
-    fn test_add_multiple_entries() {
-        let mut app = AuthenticatorApp::default();
-        app.add_entry("Alpha".into(), "SECRET1".into());
-        app.add_entry("Beta".into(), "SECRET2".into());
-        app.add_entry("Gamma".into(), "SECRET3".into());
-        assert_eq!(app.entries.len(), 3);
+    rsx! {
+        div { style: "flex: 1; display: flex; align-items: center; justify-content: center; color: #999; font-size: 16px; background: white;",
+            "Select an account or add a new one."
+        }
     }
+}
 
-    #[test]
-    fn test_remove_entry() {
-        let mut app = AuthenticatorApp::default();
-        app.add_entry("Entry1".into(), "SECRET1".into());
-        app.add_entry("Entry2".into(), "SECRET2".into());
-        app.add_entry("Entry3".into(), "SECRET3".into());
+#[component]
+fn ConfirmDeleteDialog(idx: usize) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
 
-        app.remove_entry(1);
-        assert_eq!(app.entries.len(), 2);
-        assert_eq!(app.entries[0].label, "Entry1");
-        assert_eq!(app.entries[1].label, "Entry3");
-    }
-
-    #[test]
-    fn test_remove_entry_out_of_bounds() {
-        let mut app = AuthenticatorApp::default();
-        app.add_entry("Only".into(), "SECRET".into());
-        app.remove_entry(5);
-        assert_eq!(app.entries.len(), 1);
-    }
-
-    #[test]
-    fn test_remove_entry_from_empty() {
-        let mut app = AuthenticatorApp::default();
-        app.remove_entry(0);
-        assert!(app.entries.is_empty());
-    }
-
-    #[test]
-    fn test_select_entry() {
-        let mut app = AuthenticatorApp::default();
-        app.entries.push(TotpEntry {
-            label: "test".into(),
-            secret: "JBSWY3DPEHPK3PXP".into(),
-        });
-
-        app.select_entry(0);
-        assert_eq!(app.selected_entry, Some(0));
-        assert_eq!(app.totp_code.len(), 6);
-    }
-
-    #[test]
-    fn test_get_time_remaining_range() {
-        let app = AuthenticatorApp::default();
-        let remaining = app.get_time_remaining();
-        assert!(remaining < 30);
-    }
-
-    #[test]
-    fn test_default_app_state() {
-        let app = AuthenticatorApp::default();
-        assert!(app.entries.is_empty());
-        assert!(app.error_message_app.is_none());
-        assert!(!app.is_authenticated);
-        assert!(app.selected_entry.is_none());
-        assert!(app.totp_code.is_empty());
-        assert!(app.current_file_path.is_none());
-        assert!(app.current_password.is_empty());
-        assert!(!app.show_secret);
-        assert!(!app.launch_qr_scanner);
+    rsx! {
+        div {
+            style: "position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;",
+            div {
+                style: "background: white; padding: 32px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.2); text-align: center; max-width: 360px;",
+                h3 { style: "margin: 0 0 12px 0; color: #333;", "Confirm Delete" }
+                p { style: "color: #666; margin-bottom: 24px;", "Are you sure you want to delete this account?" }
+                div {
+                    style: "display: flex; gap: 12px; justify-content: center;",
+                    button {
+                        style: "padding: 10px 20px; background: #dc3545; color: white; border: none; border-radius: 6px; cursor: pointer;",
+                        onclick: move |_| {
+                            state.with_mut(|s| {
+                                s.entries.remove(idx);
+                                s.selected_entry = None;
+                                s.pending_delete = None;
+                                s.show_secret = false;
+                                s.totp_code.clear();
+                            });
+                        },
+                        "Yes, delete"
+                    }
+                    button {
+                        style: "padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 6px; cursor: pointer;",
+                        onclick: move |_| state.with_mut(|s| s.pending_delete = None),
+                        "Cancel"
+                    }
+                }
+            }
+        }
     }
 }
