@@ -10,6 +10,11 @@ mod storage;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time::sleep;
+#[cfg(target_arch = "wasm32")]
+use gloo_timers::future::TimeoutFuture;
+
 use algo_core::{generate_totp_code, get_time_remaining};
 use storage::{load_entries_encrypted, save_entries_encrypted, TotpEntry};
 
@@ -25,14 +30,16 @@ fn main() {
 // App State
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum Screen {
+    #[default]
     Auth,
     Main,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum AuthView {
+    #[default]
     Create,
     Open,
 }
@@ -59,6 +66,13 @@ struct AppState {
 // Root App Component
 // ---------------------------------------------------------------------------
 
+async fn timer_sleep(secs: u64) {
+    #[cfg(not(target_arch = "wasm32"))]
+    sleep(Duration::from_secs(secs)).await;
+    #[cfg(target_arch = "wasm32")]
+    TimeoutFuture::new(secs as u32 * 1000).await;
+}
+
 fn app() -> Element {
     use_context_provider(|| Signal::new(AppState::default()));
 
@@ -66,10 +80,10 @@ fn app() -> Element {
 
     // Timer effect to update TOTP code every second
     use_future(move || {
-        let state_clone = state;
+        let mut state_clone = state;
         async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                timer_sleep(1).await;
                 state_clone.with_mut(|s| {
                     if let Some(idx) = s.selected_entry {
                         if let Some(entry) = s.entries.get(idx) {
@@ -144,14 +158,14 @@ fn OpenFileForm() -> Element {
             AuthInput {
                 label: "File path:",
                 value: state.read().file_path.clone(),
-                oninput: Box::new(move |val: String| state.with_mut(|s| s.file_path = val)),
+                oninput: move |val| state.with_mut(|s| s.file_path = val),
                 placeholder: "/path/to/file.totp",
                 password: false,
             }
             AuthInput {
                 label: "Password:",
                 value: state.read().password.clone(),
-                oninput: Box::new(move |val: String| state.with_mut(|s| s.password = val)),
+                oninput: move |val| state.with_mut(|s| s.password = val),
                 placeholder: "Enter password",
                 password: true,
             }
@@ -195,21 +209,21 @@ fn CreateFileForm() -> Element {
             AuthInput {
                 label: "File path:",
                 value: state.read().file_path.clone(),
-                oninput: Box::new(move |val: String| state.with_mut(|s| s.file_path = val)),
+                oninput: move |val| state.with_mut(|s| s.file_path = val),
                 placeholder: "/path/to/file.totp",
                 password: false,
             }
             AuthInput {
                 label: "Set password:",
                 value: state.read().password.clone(),
-                oninput: Box::new(move |val: String| state.with_mut(|s| s.password = val)),
+                oninput: move |val| state.with_mut(|s| s.password = val),
                 placeholder: "Enter password",
                 password: true,
             }
             AuthInput {
                 label: "Confirm password:",
                 value: state.read().password_confirm.clone(),
-                oninput: Box::new(move |val: String| state.with_mut(|s| s.password_confirm = val)),
+                oninput: move |val| state.with_mut(|s| s.password_confirm = val),
                 placeholder: "Confirm password",
                 password: true,
             }
@@ -250,7 +264,7 @@ fn try_create(state: &mut Signal<AppState>) {
 }
 
 #[component]
-fn AuthInput(label: String, value: String, oninput: Box<dyn Fn(String)>, placeholder: String, password: bool) -> Element {
+fn AuthInput(label: String, value: String, oninput: EventHandler<String>, placeholder: String, password: bool) -> Element {
     let type_attr = if password { "password" } else { "text" };
 
     rsx! {
@@ -258,7 +272,7 @@ fn AuthInput(label: String, value: String, oninput: Box<dyn Fn(String)>, placeho
         input {
             style: "padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; width: 100%; box-sizing: border-box;",
             value: "{value}",
-            oninput: move |evt| oninput(evt.value().clone()),
+            oninput: move |evt| oninput.call(evt.value().clone()),
             r#type: "{type_attr}",
             placeholder: "{placeholder}"
         }
